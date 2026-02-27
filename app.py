@@ -5,94 +5,87 @@ from geopy.geocoders import Nominatim
 import requests
 import io
 import zipfile
+import time
 
 st.set_page_config(page_title="Wiki Bulk Renamer", layout="wide")
 st.title("📸 Wiki Bulk Image Renamer")
-st.info("Upload multiple images. If GPS is missing, you can enter the location manually.")
 
-# Helper: Convert GPS to Decimal
+# --- UTILITY FUNCTIONS ---
 def get_decimal_from_dms(dms, ref):
     degrees = dms[0]
     minutes = dms[1] / 60.0
     seconds = dms[2] / 3600.0
-    if ref in ['S', 'W']:
-        return -(degrees + minutes + seconds)
-    return degrees + minutes + seconds
+    return -(degrees + minutes + seconds) if ref in ['S', 'W'] else degrees + minutes + seconds
 
 def get_city_name(lat, lon):
     try:
-        geolocator = Nominatim(user_agent="wiki_renamer_v2")
+        geolocator = Nominatim(user_agent="wiki_renamer_v3")
         location = geolocator.reverse(f"{lat}, {lon}", language='en', timeout=10)
-        address = location.raw.get('address', {})
-        return address.get('city') or address.get('town') or address.get('village') or "Unknown Location"
-    except:
-        return "Unknown Location"
+        return location.raw.get('address', {}).get('city') or location.raw.get('address', {}).get('town') or "Unknown Location"
+    except: return "Unknown Location"
 
-# --- UPLOAD SECTION ---
+def query_ai(image_bytes):
+    API_URL = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-base"
+    headers = {"Authorization": f"Bearer {st.secrets['HF_TOKEN']}"}
+    
+    # Try 3 times to account for model loading time
+    for _ in range(3):
+        response = requests.post(API_URL, headers=headers, data=image_bytes)
+        result = response.json()
+        if response.status_code == 200:
+            return result[0]['generated_text'].capitalize()
+        elif "estimated_time" in result:
+            time.sleep(result['estimated_time']) 
+        else:
+            time.sleep(3)
+    return None
+
+# --- MAIN APP FLOW ---
 uploaded_files = st.file_uploader("Upload Images", type=["jpg", "jpeg"], accept_multiple_files=True)
 
 if uploaded_files:
-    processed_images = [] # Stores (bytes, filename)
-    
+    if "final_names" not in st.session_state:
+        st.session_state.final_names = {}
+
     for i, file in enumerate(uploaded_files):
         img = Image.open(file)
         exif = img._getexif()
-        detected_city = None
+        city = None
         
-        # 1. Try to get GPS
+        # Auto-detect location if GPS exists
         if exif:
             for tag, value in exif.items():
                 if TAGS.get(tag) == "GPSInfo":
                     try:
-                        lat = get_decimal_from_dms(value[2], value[1])
-                        lon = get_decimal_from_dms(value[4], value[3])
-                        detected_city = get_city_name(lat, lon)
-                    except:
-                        detected_city = None
+                        city = get_city_name(get_decimal_from_dms(value[2], value[1]), get_decimal_from_dms(value[4], value[3]))
+                    except: pass
 
-        # 2. UI Row for each image
         with st.container(border=True):
             col1, col2, col3 = st.columns([1, 2, 2])
             col1.image(img, use_container_width=True)
             
-            # Location Logic
-            if not detected_city or detected_city == "Unknown Location":
-                location_input = col2.text_input(f"Location for {file.name}:", placeholder="e.g. Khajuraho", key=f"loc_{i}")
-            else:
-                col2.success(f"📍 Detected: {detected_city}")
-                location_input = detected_city
-
-            # Rename Logic
-            if col3.button(f"Generate Name", key=f"btn_{i}"):
-                with st.spinner("AI analyzing image..."):
-                    API_URL = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-base"
-                    headers = {"Authorization": f"Bearer {st.secrets['HF_TOKEN']}"}
-                    response = requests.post(API_URL, headers=headers, data=file.getvalue())
-                    
-                    if response.status_code == 200:
-                        caption = response.json()[0]['generated_text'].capitalize()
-                        final_name = f"{caption} in {location_input}.jpg"
-                        st.session_state[f"name_{i}"] = final_name
+            # Location Field (Manual Override)
+            loc_val = col2.text_input(f"Location for {file.name}", value=city if city else "", key=f"loc_{i}")
+            
+            # AI Renaming Button
+            if col3.button(f"Analyze & Rename", key=f"btn_{i}"):
+                with st.spinner("AI is thinking..."):
+                    caption = query_ai(file.getvalue())
+                    if caption:
+                        st.session_state.final_names[file.name] = f"{caption} in {loc_val}.jpg"
                     else:
-                        st.error("AI Model Busy. Try again in a moment.")
+                        st.error("AI Server is taking too long. Please try again in 10 seconds.")
 
-            if f"name_{i}" in st.session_state:
-                new_name = st.session_state[f"name_{i}"]
-                col3.code(new_name)
-                processed_images.append((file.getvalue(), new_name))
+            if file.name in st.session_state.final_names:
+                col3.success(f"New Name: {st.session_state.final_names[file.name]}")
 
     # --- BULK DOWNLOAD ---
-    if processed_images and len(processed_images) == len(uploaded_files):
+    if len(st.session_state.final_names) > 0:
         st.divider()
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w") as zf:
-            for img_bytes, name in processed_images:
-                zf.writestr(name, img_bytes)
+            for file in uploaded_files:
+                if file.name in st.session_state.final_names:
+                    zf.writestr(st.session_state.final_names[file.name], file.getvalue())
         
-        st.download_button(
-            label="📦 Download All Renamed Images (.zip)",
-            data=zip_buffer.getvalue(),
-            file_name="wiki_bulk_renamed.zip",
-            mime="application/zip",
-            use_container_width=True
-        )
+        st.download_button("📦 Download All Renamed Images (.zip)", zip_buffer.getvalue(), "wiki_batch_renamed.zip", "application/zip", use_container_width=True)
