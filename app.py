@@ -10,7 +10,7 @@ import time
 st.set_page_config(page_title="Wiki Bulk Renamer", layout="wide")
 st.title("📸 Wiki Bulk Image Renamer")
 
-# --- UTILS ---
+# --- UTILITY FUNCTIONS ---
 def get_decimal_from_dms(dms, ref):
     degrees = dms[0]
     minutes = dms[1] / 60.0
@@ -29,19 +29,21 @@ def query_ai(image_bytes):
     API_URL = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-base"
     headers = {"Authorization": f"Bearer {st.secrets['HF_TOKEN']}"}
     
-    # Try multiple times to allow the model to wake up
-    for _ in range(5): 
-        response = requests.post(API_URL, headers=headers, data=image_bytes)
-        result = response.json()
+    try:
+        response = requests.post(API_URL, headers=headers, data=image_bytes, timeout=30)
         if response.status_code == 200:
+            result = response.json()
             return result[0]['generated_text'].capitalize()
-        elif "estimated_time" in result:
-            wait_time = result['estimated_time']
-            st.info(f"AI model is waking up... waiting {int(wait_time)}s")
-            time.sleep(wait_time) 
+        elif response.status_code == 503:
+            # This handles the "Model Busy/Loading" state properly
+            st.warning("The AI is waking up. Please wait 15-20 seconds and click Generate again.")
+            return None
         else:
-            time.sleep(5)
-    return None
+            st.error(f"Hugging Face returned an error: {response.status_code}")
+            return None
+    except Exception as e:
+        st.error(f"Connection error: {str(e)}")
+        return None
 
 # --- APP FLOW ---
 uploaded_files = st.file_uploader("Upload Images", type=["jpg", "jpeg"], accept_multiple_files=True)
@@ -55,7 +57,7 @@ if uploaded_files:
         exif = img._getexif()
         city = None
         
-        # GPS Extraction
+        # GPS Extraction logic
         if exif:
             for tag, value in exif.items():
                 if TAGS.get(tag) == "GPSInfo":
@@ -67,16 +69,16 @@ if uploaded_files:
             col1, col2, col3 = st.columns([1, 2, 2])
             col1.image(img, use_container_width=True)
             
-            # Manual location if GPS is missing or for Khajuraho specifics
+            # Location input (Pre-filled if GPS found)
             final_city = col2.text_input(f"Location ({file.name})", value=city if city else "", placeholder="e.g. Khajuraho", key=f"loc_{i}")
             
+            # Renaming Button
             if col3.button(f"Generate Wiki Name", key=f"btn_{i}"):
-                with st.spinner("AI analyzing image..."):
+                with st.spinner("AI is analyzing..."):
                     caption = query_ai(file.getvalue())
                     if caption:
                         st.session_state.renames[file.name] = f"{caption} in {final_city}.jpg"
-                    else:
-                        st.error("AI is taking too long. Try one more time.")
+                        st.rerun()
 
             if file.name in st.session_state.renames:
                 st.session_state.renames[file.name] = col3.text_input("Edit generated name:", value=st.session_state.renames[file.name], key=f"edit_{i}")
